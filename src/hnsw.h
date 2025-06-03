@@ -150,6 +150,7 @@ struct HnswElementData
 	OffsetNumber neighborOffno;
 	BlockNumber neighborPage;
 	DatumPtr	value;
+	IndexTuple  indexTuple;           /* ACORN: IndexTuple for INCLUDE columns */
 	LWLock		lock;
 };
 
@@ -333,8 +334,8 @@ typedef struct HnswElementTupleData
 	uint8		version;
 	ItemPointerData heaptids[HNSW_HEAPTIDS];
 	ItemPointerData neighbortid;
-	uint16		unused;
-	Vector		data;
+	uint16		index_tuple_size;      /* Size of embedded IndexTuple data */
+	Vector		data;                  /* Vector data followed by IndexTuple data */
 }			HnswElementTupleData;
 
 typedef HnswElementTupleData * HnswElementTuple;

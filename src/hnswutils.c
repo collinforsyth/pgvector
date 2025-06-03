@@ -427,7 +427,9 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 void
 HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 {
-	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	Pointer     valuePtr = HnswPtrAccess(base, element->value);
+	Size        vecsize;
+	char       *idxtuple_ptr = NULL;
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
@@ -440,7 +442,23 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+
+	/* Copy vector data */
+	vecsize = VARSIZE_ANY(valuePtr);
+	memcpy(&etup->data, valuePtr, vecsize);
+
+	/* Calculate and set index tuple size and location */
+	if (element->indexTuple != NULL)
+	{
+		etup->index_tuple_size = MAXALIGN(IndexTupleSize(element->indexTuple));
+		idxtuple_ptr = (char*)&etup->data + MAXALIGN(vecsize);
+		/* Copy index tuple data */
+		memcpy(idxtuple_ptr, element->indexTuple, etup->index_tuple_size);
+	}
+	else
+	{
+		etup->index_tuple_size = 0;
+	}
 }
 
 /*
