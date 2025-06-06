@@ -394,6 +394,12 @@ typedef struct HnswScanOpaqueData
 
 	/* IndexTuple handling */
 	TupleDesc	index_tuple_desc;	/* Tuple descriptor for included columns */
+
+	/* Performance tracking for post-filtering */
+	int			candidates_examined;	/* Total candidates from HNSW */
+	int			candidates_filtered;	/* Candidates that failed predicates */
+	int			results_returned;		/* Candidates that passed predicates */
+	bool		search_expanded;		/* Whether search was expanded */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -461,6 +467,8 @@ IndexTuple	HnswFormIndexTuple(Relation index, Datum *values, bool *isnull, const
 bool		HnswEvaluatePredicates(HnswScanOpaque so, IndexTuple itup);
 void		HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so);
 Datum		HnswGetIndexAttr(IndexTuple itup, int attnum, TupleDesc tupdesc, bool *isnull);
+
+IndexTuple	HnswGetIndexTuple(Relation index, ItemPointer tid);
 
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);

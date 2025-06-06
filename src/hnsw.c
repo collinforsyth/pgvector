@@ -5,12 +5,15 @@
 
 #include "access/amapi.h"
 #include "access/reloptions.h"
+#include "access/relation.h"
+#include "access/relscan.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "hnsw.h"
 #include "miscadmin.h"
 #include "utils/float.h"
 #include "utils/guc.h"
+#include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 
@@ -235,6 +238,39 @@ hnswoptions(Datum reloptions, bool validate)
 }
 
 /*
+ * Check if index can return the specified column
+ */
+static bool
+hnswcanreturn(Relation index, int attno)
+{
+	TupleDesc	tupdesc;
+	
+	/* Basic sanity checks */
+	if (!RelationIsValid(index) || attno < 1)
+		return false;
+		
+	tupdesc = RelationGetDescr(index);
+	
+	/* Additional safety check */
+	if (!tupdesc || tupdesc->natts < 1)
+		return false;
+	
+	/* 
+	 * HNSW indexes cannot return the vector column (attno 1) because
+	 * the vector data is not stored redundantly in the index - only
+	 * connectivity information and heap TIDs are stored.
+	 * 
+	 * However, HNSW indexes CAN return INCLUDE columns (attno > 1) 
+	 * because those are stored as IndexTuple data in element tuples.
+	 */
+	if (attno == 1)
+		return false;  /* Cannot return the vector column */
+	
+	/* Can return INCLUDE columns (if they exist) */
+	return (attno <= tupdesc->natts);
+}
+
+/*
  * Validate catalog entries for the specified operator class
  */
 static bool
@@ -294,7 +330,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->ambulkdelete = hnswbulkdelete;
 	amroutine->amvacuumcleanup = hnswvacuumcleanup;
-	amroutine->amcanreturn = NULL;
+	amroutine->amcanreturn = hnswcanreturn;
 	amroutine->amcostestimate = hnswcostestimate;
 #if PG_VERSION_NUM >= 180000
 	amroutine->amgettreeheight = NULL;

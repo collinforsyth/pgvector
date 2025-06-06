@@ -1621,3 +1621,53 @@ HnswDebugPredicates(HnswScanOpaque so)
 			 i, so->predicate_attr_nums[i], key->sk_strategy, key->sk_flags);
 	}
 }
+
+/*
+ * Load IndexTuple from ItemPointer for predicate evaluation
+ */
+IndexTuple
+HnswGetIndexTuple(Relation index, ItemPointer tid)
+{
+	Buffer		buffer;
+	Page		page;
+	OffsetNumber offnum;
+	HnswElementTuple etup;
+	IndexTuple	itup;
+	Size		tupsize;
+	IndexTuple	result;
+
+	/* Read the buffer containing the tuple */
+	buffer = ReadBuffer(index, ItemPointerGetBlockNumber(tid));
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buffer);
+	offnum = ItemPointerGetOffsetNumber(tid);
+
+	/* Validate offset number */
+	if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+	{
+		UnlockReleaseBuffer(buffer);
+		elog(ERROR, "invalid offset number %u on page %u",
+			 offnum, ItemPointerGetBlockNumber(tid));
+	}
+
+	/* Get the element tuple from the page */
+	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offnum));
+
+	/* Check if this element tuple has IndexTuple data */
+	if (!HnswElementTupleHasIndexTuple(etup))
+	{
+		UnlockReleaseBuffer(buffer);
+		return NULL;
+	}
+
+	/* Get the IndexTuple from the element tuple */
+	itup = HnswElementTupleGetIndexTuple(etup);
+	
+	/* Copy the IndexTuple to scan memory context */
+	tupsize = IndexTupleSize(itup);
+	result = (IndexTuple) palloc(tupsize);
+	memcpy(result, itup, tupsize);
+
+	UnlockReleaseBuffer(buffer);
+	return result;
+}

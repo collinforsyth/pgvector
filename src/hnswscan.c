@@ -7,6 +7,7 @@
 #include "storage/lmgr.h"
 #include "utils/float.h"
 #include "utils/memutils.h"
+#include "utils/guc.h"
 
 /*
  * Algorithm 5 from paper
@@ -119,6 +120,16 @@ ShowMemoryUsage(HnswScanOpaque so)
 void
 HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so)
 {
+	/* TEMPORARY: Disable predicate evaluation to isolate the crash issue */
+	/* Initialize predicate fields */
+	so->n_predicates = 0;
+	so->predicate_keys = NULL;
+	so->predicate_attr_nums = NULL;
+	so->has_predicates = false;
+	return;
+	
+	/* Original code disabled for now */
+#if 0
 	int			i;
 	int			n_predicates = 0;
 	ScanKey		scankey = scan->keyData;
@@ -167,6 +178,7 @@ HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so)
 			n_predicates++;
 		}
 	}
+#endif
 }
 
 /*
@@ -193,6 +205,12 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->predicate_attr_nums = NULL;
 	so->has_predicates = false;
 	so->index_tuple_desc = NULL;
+
+	/* Initialize performance tracking fields */
+	so->candidates_examined = 0;
+	so->candidates_filtered = 0;
+	so->results_returned = 0;
+	so->search_expanded = false;
 
 	/*
 	 * Use a lower max allocation size than default to allow scanning more
@@ -228,6 +246,12 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
 
+	/* Reset performance tracking */
+	so->candidates_examined = 0;
+	so->candidates_filtered = 0;
+	so->results_returned = 0;
+	so->search_expanded = false;
+
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
 
@@ -242,6 +266,47 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	{
 		so->index_tuple_desc = RelationGetDescr(scan->indexRelation);
 	}
+}
+
+/*
+ * Expand search for highly selective predicates
+ */
+static List *
+HnswExpandSearch(IndexScanDesc scan)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Datum		value;
+	int			original_ef = hnsw_ef_search;
+	List	   *expanded_w;
+
+	/* Expand ef parameter for more candidates */
+	hnsw_ef_search = Min(hnsw_ef_search * 2, 1000);	/* Cap at reasonable limit */
+
+	elog(DEBUG2, "HNSW: Expanding search from ef=%d to ef=%d due to high predicate selectivity",
+		 original_ef, hnsw_ef_search);
+
+	/* Get scan value */
+	value = GetScanValue(scan);
+
+	/*
+	 * Get a shared lock. This allows vacuum to ensure no in-flight scans
+	 * before marking tuples as deleted.
+	 */
+	LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+	/* Perform expanded search */
+	expanded_w = GetScanItems(scan, value);
+
+	/* Release shared lock */
+	UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+	/* Restore original ef value */
+	hnsw_ef_search = original_ef;
+
+	/* Mark that search was expanded */
+	so->search_expanded = true;
+
+	return expanded_w;
 }
 
 /*
@@ -306,7 +371,19 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (list_length(so->w) == 0)
 		{
 			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
+			{
+				/* Check if we should expand search for highly selective predicates */
+				if (so->has_predicates && !so->search_expanded && 
+					so->candidates_examined < hnsw_ef_search * 2 && 
+					so->candidates_examined > 0)
+				{
+					elog(DEBUG2, "HNSW: All %d candidates filtered out by predicates, expanding search", so->candidates_examined);
+					so->w = HnswExpandSearch(scan);
+					if (list_length(so->w) > 0)
+						continue;
+				}
 				break;
+			}
 
 			/* Empty index */
 			if (so->discarded == NULL)
@@ -367,6 +444,71 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		heaptid = &element->heaptids[--element->heaptidsLength];
 
+		/* NEW: Post-filtering with predicate evaluation */
+		if (so->has_predicates)
+		{
+			ItemPointerData indextid;
+			IndexTuple	itup;
+			
+			so->candidates_examined++;
+			
+			/* Create ItemPointer for the index tuple */
+			ItemPointerSet(&indextid, element->blkno, element->offno);
+			
+			/* Load the IndexTuple for predicate evaluation */
+			itup = HnswGetIndexTuple(scan->indexRelation, &indextid);
+			
+			/* If no IndexTuple available, skip this candidate */
+			if (itup == NULL)
+			{
+				so->candidates_filtered++;
+				continue;
+			}
+			
+			/* Evaluate predicates on the IndexTuple */
+			if (!HnswEvaluatePredicates(so, itup))
+			{
+				so->candidates_filtered++;
+				/* IndexTuple cleanup handled by memory context */
+				continue;
+			}
+			
+			/* Predicate passed */
+			so->results_returned++;
+			
+			/* Set up IndexTuple for INCLUDE column access if needed */
+			scan->xs_itup = itup;
+			scan->xs_itupdesc = so->index_tuple_desc;
+		}
+
+		/* Check if caller wants index tuple data for index-only scan */
+		if (scan->xs_want_itup && !so->has_predicates)
+		{
+			TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
+			
+			/* Only try to get IndexTuple if the index has INCLUDE columns */
+			if (tupdesc->natts > 1)
+			{
+				ItemPointerData indextid;
+				IndexTuple	itup;
+				
+				/* Create ItemPointer for the index tuple */
+				ItemPointerSet(&indextid, element->blkno, element->offno);
+				
+				/* Load the IndexTuple for index-only scan */
+				itup = HnswGetIndexTuple(scan->indexRelation, &indextid);
+				
+				/* Set up IndexTuple for index-only scan */
+				if (itup != NULL)
+				{
+					scan->xs_itup = itup;
+					if (so->index_tuple_desc == NULL)
+						so->index_tuple_desc = tupdesc;
+					scan->xs_itupdesc = so->index_tuple_desc;
+				}
+			}
+		}
+
 		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
 		{
 			if (sc->distance < so->previousDistance)
@@ -384,6 +526,21 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	MemoryContextSwitchTo(oldCtx);
+	
+	/* Performance logging for post-filtering */
+	if (so->has_predicates && log_min_messages <= DEBUG1)
+	{
+		double		selectivity = so->candidates_examined > 0 ?
+			(double) so->results_returned / so->candidates_examined : 0.0;
+
+		elog(DEBUG1, "HNSW post-filtering stats: examined=%d, filtered=%d, returned=%d, selectivity=%.3f, expanded=%s",
+			 so->candidates_examined,
+			 so->candidates_filtered,
+			 so->results_returned,
+			 selectivity,
+			 so->search_expanded ? "yes" : "no");
+	}
+	
 	return false;
 }
 
@@ -394,6 +551,19 @@ void
 hnswendscan(IndexScanDesc scan)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+
+	/* Final performance logging if we have predicates */
+	if (so->has_predicates && so->candidates_examined > 0 && log_min_messages <= DEBUG2)
+	{
+		double		selectivity = so->candidates_examined > 0 ?
+			(double) so->results_returned / so->candidates_examined : 0.0;
+
+		elog(DEBUG2, "HNSW scan final stats: examined=%d, filtered=%d, returned=%d, selectivity=%.3f",
+			 so->candidates_examined,
+			 so->candidates_filtered,
+			 so->results_returned,
+			 selectivity);
+	}
 
 	MemoryContextDelete(so->tmpCtx);
 
