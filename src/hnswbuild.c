@@ -184,7 +184,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 		/* Calculate sizes */
 		vectorSize = VARSIZE_ANY(valuePtr);
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(vectorSize, 0);  /* No IndexTuple data during initial build */
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(vectorSize, element->index_tuple_size);
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -478,7 +478,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
  * Insert tuple
  */
 static bool
-InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
+InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate, IndexTuple indexTuple)
 {
 	HnswGraph  *graph = buildstate->graph;
 	HnswElement element;
@@ -505,7 +505,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	{
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, heaptid, true, indexTuple);
 	}
 
 	/*
@@ -537,7 +537,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, heaptid, true, indexTuple);
 	}
 
 	/* Ok, we can proceed to allocate the element */
@@ -554,6 +554,22 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	/* Copy the datum */
 	memcpy(valuePtr, DatumGetPointer(value), valueSize);
 	HnswPtrStore(base, element->value, valuePtr);
+
+	/* Store IndexTuple if present */
+	if (indexTuple)
+	{
+		Size		indexTupleSize = IndexTupleSize(indexTuple);
+		IndexTuple	copyIndexTuple = HnswAlloc(allocator, indexTupleSize);
+		
+		memcpy(copyIndexTuple, indexTuple, indexTupleSize);
+		element->indexTuple = copyIndexTuple;
+		element->index_tuple_size = indexTupleSize;
+	}
+	else
+	{
+		element->indexTuple = NULL;
+		element->index_tuple_size = 0;
+	}
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
@@ -577,22 +593,43 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	HnswBuildState *buildstate = (HnswBuildState *) state;
 	HnswGraph  *graph = buildstate->graph;
 	MemoryContext oldCtx;
+	IndexTuple	indexTuple = NULL;
+	bool		hasIncludeColumns;
 
-	/* Skip nulls */
+	/* Skip nulls in vector column */
 	if (isnull[0])
 		return;
 
 	/* Use memory context */
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
 
-	/* Insert tuple */
-	if (InsertTuple(index, values, isnull, tid, buildstate))
+	/* Check if we have INCLUDE columns beyond the vector column */
+	hasIncludeColumns = (index->rd_att->natts > 1);
+	
+	/* Form IndexTuple if we have INCLUDE columns */
+	if (hasIncludeColumns)
+	{
+		indexTuple = index_form_tuple(index->rd_att, values, isnull);
+		if (!indexTuple)
+		{
+			/* Log warning but continue - INCLUDE data is optional for functionality */
+			elog(WARNING, "Failed to form index tuple for INCLUDE columns");
+			/* Continue with NULL indexTuple */
+		}
+	}
+
+	/* Insert tuple with IndexTuple */
+	if (InsertTuple(index, values, isnull, tid, buildstate, indexTuple))
 	{
 		/* Update progress */
 		SpinLockAcquire(&graph->lock);
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
 		SpinLockRelease(&graph->lock);
 	}
+
+	/* Clean up IndexTuple if allocated */
+	if (indexTuple)
+		pfree(indexTuple);
 
 	/* Reset memory context */
 	MemoryContextSwitchTo(oldCtx);

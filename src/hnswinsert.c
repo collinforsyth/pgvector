@@ -690,7 +690,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
  * Insert a tuple into the index
  */
 bool
-HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
+HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building, IndexTuple indexTuple)
 {
 	HnswElement entryPoint;
 	HnswElement element;
@@ -712,6 +712,21 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
 	HnswPtrStore(base, element->value, DatumGetPointer(value));
+
+	/* Store IndexTuple if present */
+	if (indexTuple)
+	{
+		Size		indexTupleSize = IndexTupleSize(indexTuple);
+		
+		element->indexTuple = palloc(indexTupleSize);
+		memcpy(element->indexTuple, indexTuple, indexTupleSize);
+		element->index_tuple_size = indexTupleSize;
+	}
+	else
+	{
+		element->indexTuple = NULL;
+		element->index_tuple_size = 0;
+	}
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -748,6 +763,8 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	Datum		value;
 	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
 	HnswSupport support;
+	IndexTuple	indexTuple = NULL;
+	bool		hasIncludeColumns;
 
 	HnswInitSupport(&support, index);
 
@@ -755,7 +772,22 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
 		return;
 
-	HnswInsertTupleOnDisk(index, &support, value, heaptid, false);
+	/* Check if we have INCLUDE columns beyond the vector column */
+	hasIncludeColumns = (index->rd_att->natts > 1);
+	
+	/* Form IndexTuple if we have INCLUDE columns */
+	if (hasIncludeColumns)
+	{
+		indexTuple = index_form_tuple(index->rd_att, values, isnull);
+		/* Note: indexTuple can be NULL if formation fails */
+	}
+
+	/* Insert with IndexTuple */
+	HnswInsertTupleOnDisk(index, &support, value, heaptid, false, indexTuple);
+
+	/* Clean up */
+	if (indexTuple)
+		pfree(indexTuple);
 }
 
 /*
