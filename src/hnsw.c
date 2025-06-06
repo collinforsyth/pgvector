@@ -35,6 +35,9 @@ double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
 
+/* ACORN-1 GUC variable */
+int			hnsw_gamma;
+
 /*
  * Assign a tranche ID for our LWLocks. This only needs to be done by one
  * backend, as the tranche ID is remembered in shared memory.
@@ -77,6 +80,9 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	
+	add_int_reloption(hnsw_relopt_kind, "gamma", "ACORN neighbor expansion factor",
+					  HNSW_DEFAULT_GAMMA, HNSW_MIN_GAMMA, HNSW_MAX_GAMMA, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -95,6 +101,12 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* NEW: ACORN-1 GUC configuration */
+	DefineCustomIntVariable("hnsw.gamma", "ACORN neighbor expansion factor",
+							"Controls how many additional neighbors to examine when predicates filter connections. Valid range is 1..10.",
+							&hnsw_gamma,
+							HNSW_DEFAULT_GAMMA, HNSW_MIN_GAMMA, HNSW_MAX_GAMMA, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }
@@ -229,6 +241,7 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
+		{"gamma", RELOPT_TYPE_INT, offsetof(HnswOptions, gamma)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

@@ -43,6 +43,11 @@
 #define HNSW_MIN_EF_SEARCH		1
 #define HNSW_MAX_EF_SEARCH		1000
 
+/* ACORN-1 parameters */
+#define HNSW_DEFAULT_GAMMA 2
+#define HNSW_MIN_GAMMA 1
+#define HNSW_MAX_GAMMA 10
+
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
 #define HNSW_NEIGHBOR_TUPLE_TYPE 2
@@ -114,6 +119,9 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
+
+/* ACORN-1 GUC variable */
+extern int	hnsw_gamma;
 
 typedef enum HnswIterativeScanMode
 {
@@ -189,6 +197,9 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	
+	/* ACORN-1 parameters */
+	int			gamma;			/* neighbor expansion factor */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -400,6 +411,13 @@ typedef struct HnswScanOpaqueData
 	int			candidates_filtered;	/* Candidates that failed predicates */
 	int			results_returned;		/* Candidates that passed predicates */
 	bool		search_expanded;		/* Whether search was expanded */
+	
+	/* ACORN-1 state */
+	bool		use_acorn;			/* Whether to use ACORN-1 vs post-filtering */
+	int			gamma;				/* Current gamma value */
+	int			predicate_passes;	/* Nodes that passed predicates during traversal */
+	int			predicate_failures; /* Nodes that failed predicates during traversal */
+	int			expansions_performed; /* Number of neighbor expansions */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -541,5 +559,12 @@ typedef struct OffsetHashEntry
 #define SH_SCOPE extern
 #define SH_DECLARE
 #include "lib/simplehash.h"
+
+/* Functions in hnswscan.c */
+IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
+void		hnswendscan(IndexScanDesc scan);
+void		HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so);
 
 #endif
