@@ -277,7 +277,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 170000
 	amroutine->amcanbuildparallel = true;
 #endif
-	amroutine->amcaninclude = false;
+	amroutine->amcaninclude = true;
 	amroutine->amusemaintenanceworkmem = false; /* not used during VACUUM */
 #if PG_VERSION_NUM >= 160000
 	amroutine->amsummarizing = false;
