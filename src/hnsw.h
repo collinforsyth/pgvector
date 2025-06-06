@@ -385,6 +385,15 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* Predicate evaluation fields */
+	int			n_predicates;		/* Number of predicates on included columns */
+	ScanKey		predicate_keys;		/* Array of scan keys for predicates */
+	int		   *predicate_attr_nums; /* Attribute numbers for each predicate */
+	bool		has_predicates;		/* Quick check if any predicates exist */
+
+	/* IndexTuple handling */
+	TupleDesc	index_tuple_desc;	/* Tuple descriptor for included columns */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -447,6 +456,12 @@ void		HnswSetElementTupleIndexTuple(HnswElementTuple etup, IndexTuple itup);
 IndexTuple	HnswElementTupleGetIndexTuple(HnswElementTuple etup);
 bool		HnswElementTupleHasIndexTuple(HnswElementTuple etup);
 IndexTuple	HnswFormIndexTuple(Relation index, Datum *values, bool *isnull, const HnswTypeInfo *typeInfo, HnswSupport *support);
+
+/* Predicate evaluation functions */
+bool		HnswEvaluatePredicates(HnswScanOpaque so, IndexTuple itup);
+void		HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so);
+Datum		HnswGetIndexAttr(IndexTuple itup, int attnum, TupleDesc tupdesc, bool *isnull);
+
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);

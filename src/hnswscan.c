@@ -114,6 +114,62 @@ ShowMemoryUsage(HnswScanOpaque so)
 #endif
 
 /*
+ * Extract predicates for included columns from scan keys
+ */
+void
+HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so)
+{
+	int			i;
+	int			n_predicates = 0;
+	ScanKey		scankey = scan->keyData;
+	int			nscankeys = scan->numberOfKeys;
+	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
+
+	/* Initialize predicate fields */
+	so->n_predicates = 0;
+	so->predicate_keys = NULL;
+	so->predicate_attr_nums = NULL;
+	so->has_predicates = false;
+
+	/* Count predicates on included columns (skip vector column at index 1) */
+	for (i = 0; i < nscankeys; i++)
+	{
+		int			attnum = scankey[i].sk_attno;
+
+		/* Skip vector column (attnum 1) and invalid attributes */
+		if (attnum > 1 && attnum <= tupdesc->natts)
+		{
+			n_predicates++;
+		}
+	}
+
+	/* No predicates found */
+	if (n_predicates == 0)
+		return;
+
+	/* Allocate arrays for predicate information */
+	so->predicate_keys = (ScanKey) palloc(n_predicates * sizeof(ScanKeyData));
+	so->predicate_attr_nums = (int *) palloc(n_predicates * sizeof(int));
+	so->n_predicates = n_predicates;
+	so->has_predicates = true;
+
+	/* Copy predicate scan keys and attribute numbers */
+	n_predicates = 0;
+	for (i = 0; i < nscankeys; i++)
+	{
+		int			attnum = scankey[i].sk_attno;
+
+		/* Skip vector column (attnum 1) and invalid attributes */
+		if (attnum > 1 && attnum <= tupdesc->natts)
+		{
+			so->predicate_keys[n_predicates] = scankey[i];
+			so->predicate_attr_nums[n_predicates] = attnum;
+			n_predicates++;
+		}
+	}
+}
+
+/*
  * Prepare for an index scan
  */
 IndexScanDesc
@@ -130,6 +186,13 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
+
+	/* Initialize predicate fields */
+	so->n_predicates = 0;
+	so->predicate_keys = NULL;
+	so->predicate_attr_nums = NULL;
+	so->has_predicates = false;
+	so->index_tuple_desc = NULL;
 
 	/*
 	 * Use a lower max allocation size than default to allow scanning more
@@ -170,6 +233,15 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 
 	if (orderbys && scan->numberOfOrderBys > 0)
 		memmove(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
+
+	/* Extract predicates for included columns */
+	HnswExtractPredicates(scan, so);
+
+	/* Initialize tuple descriptor for included columns if we have predicates */
+	if (so->has_predicates && so->index_tuple_desc == NULL)
+	{
+		so->index_tuple_desc = RelationGetDescr(scan->indexRelation);
+	}
 }
 
 /*

@@ -1508,14 +1508,14 @@ HnswFormIndexTuple(Relation index, Datum *values, bool *isnull, const HnswTypeIn
 {
 	TupleDesc	tupleDesc = RelationGetDescr(index);
 	IndexTuple	itup;
-	
+
 	/* Only create IndexTuple if there are included columns beyond the vector column */
 	if (tupleDesc->natts <= 1)
 		return NULL;
-	
+
 	/* Use PostgreSQL's index_form_tuple to create the IndexTuple */
 	itup = index_form_tuple(tupleDesc, values, isnull);
-	
+
 	return itup;
 }
 
@@ -1534,4 +1534,90 @@ HnswSetElementTupleIndexTuple(HnswElementTuple etup, IndexTuple itup)
 	/* Copy IndexTuple after vector data */
 	memcpy((char *)&etup->data + VARSIZE_ANY(&etup->data), itup, IndexTupleSize(itup));
 	etup->index_tuple_size = IndexTupleSize(itup);
+}
+
+/*
+ * Extract attribute value from IndexTuple
+ */
+Datum
+HnswGetIndexAttr(IndexTuple itup, int attnum, TupleDesc tupdesc, bool *isnull)
+{
+	/*
+	 * Note: attnum is 1-based for index_getattr
+	 * Vector column is at position 1, included columns start at 2
+	 */
+	return index_getattr(itup, attnum, tupdesc, isnull);
+}
+
+/*
+ * Evaluate predicates on included columns for a given IndexTuple
+ */
+bool
+HnswEvaluatePredicates(HnswScanOpaque so, IndexTuple itup)
+{
+	int			i;
+
+	/* No predicates means all tuples pass */
+	if (!so->has_predicates)
+		return true;
+
+	/* Evaluate each predicate */
+	for (i = 0; i < so->n_predicates; i++)
+	{
+		ScanKey		key = &so->predicate_keys[i];
+		int			attnum = so->predicate_attr_nums[i];
+		Datum		test_val;
+		bool		test_null;
+		bool		key_null;
+
+		/* Extract attribute value from IndexTuple */
+		test_val = HnswGetIndexAttr(itup, attnum, so->index_tuple_desc, &test_null);
+
+		/* Handle NULL values according to PostgreSQL semantics */
+		key_null = (key->sk_flags & SK_ISNULL) != 0;
+
+		if (key_null || test_null)
+		{
+			if (key_null && test_null)
+				continue;		/* NULL = NULL is true */
+			else
+				return false;	/* NULL vs non-NULL is false */
+		}
+
+		/* Evaluate using scan key's comparison function */
+		if (!DatumGetBool(FunctionCall2Coll(&key->sk_func,
+											key->sk_collation,
+											test_val,
+											key->sk_argument)))
+		{
+			return false;		/* Predicate failed */
+		}
+	}
+
+	return true;				/* All predicates passed */
+}
+
+/*
+ * Debug function for predicate evaluation (for development)
+ */
+static void
+HnswDebugPredicates(HnswScanOpaque so)
+{
+	int			i;
+
+	if (!so->has_predicates)
+	{
+		elog(DEBUG1, "HNSW: No predicates defined");
+		return;
+	}
+
+	elog(DEBUG1, "HNSW: %d predicates defined:", so->n_predicates);
+
+	for (i = 0; i < so->n_predicates; i++)
+	{
+		ScanKey		key = &so->predicate_keys[i];
+
+		elog(DEBUG1, "  Predicate %d: attnum=%d, strategy=%d, flags=0x%x",
+			 i, so->predicate_attr_nums[i], key->sk_strategy, key->sk_flags);
+	}
 }
