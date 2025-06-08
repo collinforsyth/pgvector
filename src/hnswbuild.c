@@ -544,6 +544,14 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
 	valuePtr = HnswAlloc(allocator, valueSize);
 
+	/* Allocate IndexTuple space if needed while still holding allocator lock */
+	IndexTuple copyIndexTuple = NULL;
+	if (indexTuple)
+	{
+		Size indexTupleSize = IndexTupleSize(indexTuple);
+		copyIndexTuple = HnswAlloc(allocator, indexTupleSize);
+	}
+
 	/*
 	 * We have now allocated the space needed for the element, so we don't
 	 * need the allocator lock anymore. Release it and initialize the rest of
@@ -558,9 +566,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	/* Store IndexTuple if present */
 	if (indexTuple)
 	{
-		Size		indexTupleSize = IndexTupleSize(indexTuple);
-		IndexTuple	copyIndexTuple = HnswAlloc(allocator, indexTupleSize);
-		
+		Size indexTupleSize = IndexTupleSize(indexTuple);
 		memcpy(copyIndexTuple, indexTuple, indexTupleSize);
 		element->indexTuple = copyIndexTuple;
 		element->index_tuple_size = indexTupleSize;

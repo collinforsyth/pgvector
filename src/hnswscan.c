@@ -390,7 +390,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		else
 		{
 			elog(DEBUG2, "HNSW: Starting standard HNSW search");
-			so->w = GetScanItems(scan, value);
+		so->w = GetScanItems(scan, value);
 		}
 
 		/* Release shared lock */
@@ -589,12 +589,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		}
 		else
 		{
-			elog(DEBUG1, "HNSW post-filtering stats: examined=%d, filtered=%d, returned=%d, selectivity=%.3f, expanded=%s",
-				 so->candidates_examined,
-				 so->candidates_filtered,
-				 so->results_returned,
-				 selectivity,
-				 so->search_expanded ? "yes" : "no");
+		elog(DEBUG1, "HNSW post-filtering stats: examined=%d, filtered=%d, returned=%d, selectivity=%.3f, expanded=%s",
+			 so->candidates_examined,
+			 so->candidates_filtered,
+			 so->results_returned,
+			 selectivity,
+			 so->search_expanded ? "yes" : "no");
 		}
 	}
 	
