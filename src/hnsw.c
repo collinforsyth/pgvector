@@ -5,12 +5,15 @@
 
 #include "access/amapi.h"
 #include "access/reloptions.h"
+#include "access/relation.h"
+#include "access/relscan.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "hnsw.h"
 #include "miscadmin.h"
 #include "utils/float.h"
 #include "utils/guc.h"
+#include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 
@@ -31,6 +34,9 @@ int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
+
+/* ACORN-1 GUC variable */
+int			hnsw_gamma;
 
 /*
  * Assign a tranche ID for our LWLocks. This only needs to be done by one
@@ -82,6 +88,9 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	
+	add_int_reloption(hnsw_relopt_kind, "gamma", "ACORN neighbor expansion factor",
+					  HNSW_DEFAULT_GAMMA, HNSW_MIN_GAMMA, HNSW_MAX_GAMMA, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -100,6 +109,12 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* NEW: ACORN-1 GUC configuration */
+	DefineCustomIntVariable("hnsw.gamma", "ACORN neighbor expansion factor",
+							"Controls how many additional neighbors to examine when predicates filter connections. Valid range is 1..10.",
+							&hnsw_gamma,
+							HNSW_DEFAULT_GAMMA, HNSW_MIN_GAMMA, HNSW_MAX_GAMMA, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }
@@ -234,12 +249,46 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
+		{"gamma", RELOPT_TYPE_INT, offsetof(HnswOptions, gamma)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
 									  hnsw_relopt_kind,
 									  sizeof(HnswOptions),
 									  tab, lengthof(tab));
+}
+
+/*
+ * Check if index can return the specified column
+ */
+static bool
+hnswcanreturn(Relation index, int attno)
+{
+	TupleDesc	tupdesc;
+	
+	/* Basic sanity checks */
+	if (!RelationIsValid(index) || attno < 1)
+		return false;
+		
+	tupdesc = RelationGetDescr(index);
+	
+	/* Additional safety check */
+	if (!tupdesc || tupdesc->natts < 1)
+		return false;
+	
+	/* 
+	 * HNSW indexes cannot return the vector column (attno 1) because
+	 * the vector data is not stored redundantly in the index - only
+	 * connectivity information and heap TIDs are stored.
+	 * 
+	 * However, HNSW indexes CAN return INCLUDE columns (attno > 1) 
+	 * because those are stored as IndexTuple data in element tuples.
+	 */
+	if (attno == 1)
+		return false;  /* Cannot return the vector column */
+	
+	/* Can return INCLUDE columns (if they exist) */
+	return (attno <= tupdesc->natts);
 }
 
 /*
@@ -285,7 +334,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 170000
 	amroutine->amcanbuildparallel = true;
 #endif
-	amroutine->amcaninclude = false;
+	amroutine->amcaninclude = true;
 	amroutine->amusemaintenanceworkmem = false; /* not used during VACUUM */
 #if PG_VERSION_NUM >= 160000
 	amroutine->amsummarizing = false;
@@ -302,7 +351,7 @@ hnswhandler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->ambulkdelete = hnswbulkdelete;
 	amroutine->amvacuumcleanup = hnswvacuumcleanup;
-	amroutine->amcanreturn = NULL;
+	amroutine->amcanreturn = hnswcanreturn;
 	amroutine->amcostestimate = hnswcostestimate;
 #if PG_VERSION_NUM >= 180000
 	amroutine->amgettreeheight = NULL;

@@ -43,6 +43,11 @@
 #define HNSW_MIN_EF_SEARCH		1
 #define HNSW_MAX_EF_SEARCH		1000
 
+/* ACORN-1 parameters */
+#define HNSW_DEFAULT_GAMMA 2
+#define HNSW_MIN_GAMMA 1
+#define HNSW_MAX_GAMMA 10
+
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
 #define HNSW_NEIGHBOR_TUPLE_TYPE 2
@@ -60,7 +65,8 @@
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
-#define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
+#define HNSW_ELEMENT_TUPLE_SIZE(size, index_tuple_size) \
+	MAXALIGN(offsetof(HnswElementTupleData, data) + (size) + (index_tuple_size))
 #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
@@ -114,6 +120,9 @@ extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
 
+/* ACORN-1 GUC variable */
+extern int	hnsw_gamma;
+
 typedef enum HnswIterativeScanMode
 {
 	HNSW_ITERATIVE_SCAN_OFF,
@@ -121,9 +130,11 @@ typedef enum HnswIterativeScanMode
 	HNSW_ITERATIVE_SCAN_STRICT
 }			HnswIterativeScanMode;
 
+/* Forward declarations */
 typedef struct HnswElementData HnswElementData;
 typedef struct HnswNeighborArray HnswNeighborArray;
 
+/* Pointer declarations */
 #define HnswPtrDeclare(type, relptrtype, ptrtype) \
 	relptr_declare(type, relptrtype); \
 	typedef union { type *ptr; relptrtype relptr; } ptrtype
@@ -135,6 +146,7 @@ HnswPtrDeclare(HnswNeighborArray, HnswNeighborArrayRelptr, HnswNeighborArrayPtr)
 HnswPtrDeclare(HnswNeighborArrayPtr, HnswNeighborsRelptr, HnswNeighborsPtr);
 HnswPtrDeclare(char, DatumRelptr, DatumPtr);
 
+/* Now define the actual structures */
 struct HnswElementData
 {
 	HnswElementPtr next;
@@ -144,12 +156,14 @@ struct HnswElementData
 	uint8		deleted;
 	uint8		version;
 	uint32		hash;
+	uint16		index_tuple_size;  /* Size of the IndexTuple data */
 	HnswNeighborsPtr neighbors;
 	BlockNumber blkno;
 	OffsetNumber offno;
 	OffsetNumber neighborOffno;
 	BlockNumber neighborPage;
 	DatumPtr	value;
+	IndexTuple	indexTuple;		/* IndexTuple for INCLUDE columns (in-memory only) */
 	LWLock		lock;
 };
 
@@ -183,6 +197,9 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	
+	/* ACORN-1 parameters */
+	int			gamma;			/* neighbor expansion factor */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -333,8 +350,9 @@ typedef struct HnswElementTupleData
 	uint8		version;
 	ItemPointerData heaptids[HNSW_HEAPTIDS];
 	ItemPointerData neighbortid;
-	uint16		unused;
+	uint16		index_tuple_size;  /* Size of the IndexTuple data */
 	Vector		data;
+	/* IndexTuple data follows the vector data */
 }			HnswElementTupleData;
 
 typedef HnswElementTupleData * HnswElementTuple;
@@ -378,6 +396,28 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* Predicate evaluation fields */
+	int			n_predicates;		/* Number of predicates on included columns */
+	ScanKey		predicate_keys;		/* Array of scan keys for predicates */
+	int		   *predicate_attr_nums; /* Attribute numbers for each predicate */
+	bool		has_predicates;		/* Quick check if any predicates exist */
+
+	/* IndexTuple handling */
+	TupleDesc	index_tuple_desc;	/* Tuple descriptor for included columns */
+
+	/* Performance tracking for post-filtering */
+	int			candidates_examined;	/* Total candidates from HNSW */
+	int			candidates_filtered;	/* Candidates that failed predicates */
+	int			results_returned;		/* Candidates that passed predicates */
+	bool		search_expanded;		/* Whether search was expanded */
+	
+	/* ACORN-1 state */
+	bool		use_acorn;			/* Whether to use ACORN-1 vs post-filtering */
+	int			gamma;				/* Current gamma value */
+	int			predicate_passes;	/* Nodes that passed predicates during traversal */
+	int			predicate_failures; /* Nodes that failed predicates during traversal */
+	int			expansions_performed; /* Number of neighbor expansions */
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -430,12 +470,24 @@ void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, in
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
 void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
-bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
+bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building, IndexTuple indexTuple);
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
+void		HnswSetElementTupleIndexTuple(HnswElementTuple etup, IndexTuple itup);
+IndexTuple	HnswElementTupleGetIndexTuple(HnswElementTuple etup);
+bool		HnswElementTupleHasIndexTuple(HnswElementTuple etup);
+IndexTuple	HnswFormIndexTuple(Relation index, Datum *values, bool *isnull, const HnswTypeInfo *typeInfo, HnswSupport *support);
+
+/* Predicate evaluation functions */
+bool		HnswEvaluatePredicates(HnswScanOpaque so, IndexTuple itup);
+void		HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so);
+Datum		HnswGetIndexAttr(IndexTuple itup, int attnum, TupleDesc tupdesc, bool *isnull);
+
+IndexTuple	HnswGetIndexTuple(Relation index, ItemPointer tid);
+
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
@@ -507,5 +559,12 @@ typedef struct OffsetHashEntry
 #define SH_SCOPE extern
 #define SH_DECLARE
 #include "lib/simplehash.h"
+
+/* Functions in hnswscan.c */
+IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
+void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
+bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
+void		hnswendscan(IndexScanDesc scan);
+void		HnswExtractPredicates(IndexScanDesc scan, HnswScanOpaque so);
 
 #endif

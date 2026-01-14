@@ -1,13 +1,15 @@
 #include "postgres.h"
-
-#include <math.h>
-
+#include "access/genam.h"
 #include "access/generic_xlog.h"
-#include "hnsw.h"
+#include "access/relation.h"
+#include "access/xlog.h"
+#include "catalog/index.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
-#include "utils/datum.h"
 #include "utils/memutils.h"
+#include "hnsw.h"
+#include <math.h>
+#include "utils/datum.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -162,7 +164,8 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	char	   *base = NULL;
 
 	/* Calculate sizes */
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+	Size		vectorSize = VARSIZE_ANY(HnswPtrAccess(base, e->value));
+	etupSize = HNSW_ELEMENT_TUPLE_SIZE(vectorSize, e->index_tuple_size);
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -691,7 +694,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
  * Insert a tuple into the index
  */
 bool
-HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
+HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building, IndexTuple indexTuple)
 {
 	HnswElement entryPoint;
 	HnswElement element;
@@ -713,6 +716,21 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
 	HnswPtrStore(base, element->value, DatumGetPointer(value));
+
+	/* Store IndexTuple if present */
+	if (indexTuple)
+	{
+		Size		indexTupleSize = IndexTupleSize(indexTuple);
+		
+		element->indexTuple = palloc(indexTupleSize);
+		memcpy(element->indexTuple, indexTuple, indexTupleSize);
+		element->index_tuple_size = indexTupleSize;
+	}
+	else
+	{
+		element->indexTuple = NULL;
+		element->index_tuple_size = 0;
+	}
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -749,6 +767,8 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	Datum		value;
 	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
 	HnswSupport support;
+	IndexTuple	indexTuple = NULL;
+	bool		hasIncludeColumns;
 
 	HnswInitSupport(&support, index);
 
@@ -756,7 +776,22 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
 		return;
 
-	HnswInsertTupleOnDisk(index, &support, value, heaptid, false);
+	/* Check if we have INCLUDE columns beyond the vector column */
+	hasIncludeColumns = (index->rd_att->natts > 1);
+	
+	/* Form IndexTuple if we have INCLUDE columns */
+	if (hasIncludeColumns)
+	{
+		indexTuple = index_form_tuple(index->rd_att, values, isnull);
+		/* Note: indexTuple can be NULL if formation fails */
+	}
+
+	/* Insert with IndexTuple */
+	HnswInsertTupleOnDisk(index, &support, value, heaptid, false, indexTuple);
+
+	/* Clean up */
+	if (indexTuple)
+		pfree(indexTuple);
 }
 
 /*

@@ -2,17 +2,26 @@
 
 #include <math.h>
 
+#include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/itup.h"
+#include "access/relation.h"
+#include "access/xlog.h"
+#include "catalog/index.h"
+#include "storage/bufmgr.h"
+#include "storage/lmgr.h"
+#include "utils/datum.h"
+#include "utils/memutils.h"
+#include "utils/memdebug.h"
+
+#include "hnsw.h"
+
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
-#include "hnsw.h"
 #include "lib/pairingheap.h"
 #include "sparsevec.h"
-#include "storage/bufmgr.h"
-#include "utils/datum.h"
-#include "utils/memdebug.h"
 #include "utils/rel.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -261,6 +270,8 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 	HnswInitNeighbors(base, element, m, allocator);
 
 	HnswPtrStore(base, element->value, (Pointer) NULL);
+	element->indexTuple = NULL;  /* Initialize IndexTuple pointer */
+	element->index_tuple_size = 0;  /* Initialize IndexTuple size */
 
 	return element;
 }
@@ -287,6 +298,8 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
 	element->offno = offno;
 	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
 	HnswPtrStore(base, element->value, (Pointer) NULL);
+	element->indexTuple = NULL;  /* Initialize IndexTuple pointer */
+	element->index_tuple_size = 0;  /* Initialize IndexTuple size */
 	return element;
 }
 
@@ -432,11 +445,13 @@ void
 HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 {
 	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	Size		valueSize = VARSIZE_ANY(valuePtr);
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
 	etup->deleted = 0;
 	etup->version = element->version;
+	
 	for (int i = 0; i < HNSW_HEAPTIDS; i++)
 	{
 		if (i < element->heaptidsLength)
@@ -444,7 +459,23 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+	
+	/* Copy vector data */
+	memcpy(&etup->data, valuePtr, valueSize);
+	
+	/* Embed IndexTuple data if present */
+	if (element->indexTuple != NULL)
+	{
+		Size		indexTupleSize = IndexTupleSize(element->indexTuple);
+		char	   *indexTuplePtr = (char *)&etup->data + valueSize;
+		
+		memcpy(indexTuplePtr, element->indexTuple, indexTupleSize);
+		etup->index_tuple_size = indexTupleSize;
+	}
+	else
+	{
+		etup->index_tuple_size = 0;  /* No IndexTuple data */
+	}
 }
 
 /*
@@ -510,9 +541,35 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	if (loadVec)
 	{
 		char	   *base = NULL;
-		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
+		Size		vectorSize = VARSIZE_ANY(&etup->data);
+		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, vectorSize);
 
 		HnswPtrStore(base, element->value, DatumGetPointer(value));
+	}
+
+	/* Store IndexTuple size and load IndexTuple data if present */
+	element->index_tuple_size = etup->index_tuple_size;
+	
+	if (etup->index_tuple_size > 0)
+	{
+		IndexTuple	itup = HnswElementTupleGetIndexTuple(etup);
+		
+		if (itup != NULL)
+		{
+			/* Copy IndexTuple to local memory */
+			Size		indexTupleSize = IndexTupleSize(itup);
+			
+			element->indexTuple = palloc(indexTupleSize);
+			memcpy(element->indexTuple, itup, indexTupleSize);
+		}
+		else
+		{
+			element->indexTuple = NULL;
+		}
+	}
+	else
+	{
+		element->indexTuple = NULL;
 	}
 }
 
@@ -1423,4 +1480,198 @@ hnsw_sparsevec_support(PG_FUNCTION_ARGS)
 	};
 
 	PG_RETURN_POINTER(&typeInfo);
+}
+
+/*
+ * Get pointer to IndexTuple data in element tuple
+ */
+IndexTuple
+HnswElementTupleGetIndexTuple(HnswElementTuple etup)
+{
+	if (etup->index_tuple_size == 0)
+		return NULL;
+
+	/* IndexTuple data follows vector data */
+	return (IndexTuple)((char *)&etup->data + VARSIZE_ANY(&etup->data));
+}
+
+/*
+ * Check if element tuple has IndexTuple data
+ */
+bool
+HnswElementTupleHasIndexTuple(HnswElementTuple etup)
+{
+	return etup->index_tuple_size > 0;
+}
+
+/*
+ * Form IndexTuple from column values
+ */
+IndexTuple
+HnswFormIndexTuple(Relation index, Datum *values, bool *isnull, const HnswTypeInfo *typeInfo, HnswSupport *support)
+{
+	TupleDesc	tupleDesc = RelationGetDescr(index);
+	IndexTuple	itup;
+
+	/* Only create IndexTuple if there are included columns beyond the vector column */
+	if (tupleDesc->natts <= 1)
+		return NULL;
+
+	/* Use PostgreSQL's index_form_tuple to create the IndexTuple */
+	itup = index_form_tuple(tupleDesc, values, isnull);
+
+	return itup;
+}
+
+/*
+ * Set IndexTuple data in element tuple
+ */
+void
+HnswSetElementTupleIndexTuple(HnswElementTuple etup, IndexTuple itup)
+{
+	if (itup == NULL)
+	{
+		etup->index_tuple_size = 0;
+		return;
+	}
+
+	/* Copy IndexTuple after vector data */
+	memcpy((char *)&etup->data + VARSIZE_ANY(&etup->data), itup, IndexTupleSize(itup));
+	etup->index_tuple_size = IndexTupleSize(itup);
+}
+
+/*
+ * Extract attribute value from IndexTuple
+ */
+Datum
+HnswGetIndexAttr(IndexTuple itup, int attnum, TupleDesc tupdesc, bool *isnull)
+{
+	/*
+	 * Note: attnum is 1-based for index_getattr
+	 * Vector column is at position 1, included columns start at 2
+	 */
+	return index_getattr(itup, attnum, tupdesc, isnull);
+}
+
+/*
+ * Evaluate predicates on included columns for a given IndexTuple
+ */
+bool
+HnswEvaluatePredicates(HnswScanOpaque so, IndexTuple itup)
+{
+	int			i;
+
+	/* No predicates means all tuples pass */
+	if (!so->has_predicates)
+		return true;
+
+	/* Evaluate each predicate */
+	for (i = 0; i < so->n_predicates; i++)
+	{
+		ScanKey		key = &so->predicate_keys[i];
+		int			attnum = so->predicate_attr_nums[i];
+		Datum		test_val;
+		bool		test_null;
+		bool		key_null;
+
+		/* Extract attribute value from IndexTuple */
+		test_val = HnswGetIndexAttr(itup, attnum, so->index_tuple_desc, &test_null);
+
+		/* Handle NULL values according to PostgreSQL semantics */
+		key_null = (key->sk_flags & SK_ISNULL) != 0;
+
+		if (key_null || test_null)
+		{
+			if (key_null && test_null)
+				continue;		/* NULL = NULL is true */
+			else
+				return false;	/* NULL vs non-NULL is false */
+		}
+
+		/* Evaluate using scan key's comparison function */
+		if (!DatumGetBool(FunctionCall2Coll(&key->sk_func,
+											key->sk_collation,
+											test_val,
+											key->sk_argument)))
+		{
+			return false;		/* Predicate failed */
+		}
+	}
+
+	return true;				/* All predicates passed */
+}
+
+/*
+ * Debug function for predicate evaluation (for development)
+ */
+static void
+HnswDebugPredicates(HnswScanOpaque so)
+{
+	int			i;
+
+	if (!so->has_predicates)
+	{
+		elog(DEBUG1, "HNSW: No predicates defined");
+		return;
+	}
+
+	elog(DEBUG1, "HNSW: %d predicates defined:", so->n_predicates);
+
+	for (i = 0; i < so->n_predicates; i++)
+	{
+		ScanKey		key = &so->predicate_keys[i];
+
+		elog(DEBUG1, "  Predicate %d: attnum=%d, strategy=%d, flags=0x%x",
+			 i, so->predicate_attr_nums[i], key->sk_strategy, key->sk_flags);
+	}
+}
+
+/*
+ * Load IndexTuple from ItemPointer for predicate evaluation
+ */
+IndexTuple
+HnswGetIndexTuple(Relation index, ItemPointer tid)
+{
+	Buffer		buffer;
+	Page		page;
+	OffsetNumber offnum;
+	HnswElementTuple etup;
+	IndexTuple	itup;
+	Size		tupsize;
+	IndexTuple	result;
+
+	/* Read the buffer containing the tuple */
+	buffer = ReadBuffer(index, ItemPointerGetBlockNumber(tid));
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buffer);
+	offnum = ItemPointerGetOffsetNumber(tid);
+
+	/* Validate offset number */
+	if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+	{
+		UnlockReleaseBuffer(buffer);
+		elog(ERROR, "invalid offset number %u on page %u",
+			 offnum, ItemPointerGetBlockNumber(tid));
+	}
+
+	/* Get the element tuple from the page */
+	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offnum));
+
+	/* Check if this element tuple has IndexTuple data */
+	if (!HnswElementTupleHasIndexTuple(etup))
+	{
+		UnlockReleaseBuffer(buffer);
+		return NULL;
+	}
+
+	/* Get the IndexTuple from the element tuple */
+	itup = HnswElementTupleGetIndexTuple(etup);
+	
+	/* Copy the IndexTuple to scan memory context */
+	tupsize = IndexTupleSize(itup);
+	result = (IndexTuple) palloc(tupsize);
+	memcpy(result, itup, tupsize);
+
+	UnlockReleaseBuffer(buffer);
+	return result;
 }

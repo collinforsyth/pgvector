@@ -69,6 +69,12 @@
 #include "utils/wait_event.h"
 #endif
 
+#include "access/genam.h"
+#include "access/generic_xlog.h"
+#include "access/relation.h"
+#include "access/xlog.h"
+#include "storage/lmgr.h"
+
 #define PARALLEL_KEY_HNSW_SHARED		UINT64CONST(0xA000000000000001)
 #define PARALLEL_KEY_HNSW_AREA			UINT64CONST(0xA000000000000002)
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
@@ -171,6 +177,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		Size		etupSize;
 		Size		ntupSize;
 		Size		combinedSize;
+		Size		vectorSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
 		/* Update iterator */
@@ -180,7 +187,8 @@ CreateGraphPages(HnswBuildState * buildstate)
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		vectorSize = VARSIZE_ANY(valuePtr);
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(vectorSize, element->index_tuple_size);
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -474,7 +482,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
  * Insert tuple
  */
 static bool
-InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
+InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate, IndexTuple indexTuple)
 {
 	HnswGraph  *graph = buildstate->graph;
 	HnswElement element;
@@ -501,7 +509,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	{
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, heaptid, true, indexTuple);
 	}
 
 	/*
@@ -533,12 +541,20 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 
 		LWLockRelease(flushLock);
 
-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
+		return HnswInsertTupleOnDisk(index, support, value, heaptid, true, indexTuple);
 	}
 
 	/* Ok, we can proceed to allocate the element */
 	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
 	valuePtr = HnswAlloc(allocator, valueSize);
+
+	/* Allocate IndexTuple space if needed while still holding allocator lock */
+	IndexTuple copyIndexTuple = NULL;
+	if (indexTuple)
+	{
+		Size indexTupleSize = IndexTupleSize(indexTuple);
+		copyIndexTuple = HnswAlloc(allocator, indexTupleSize);
+	}
 
 	/*
 	 * We have now allocated the space needed for the element, so we don't
@@ -550,6 +566,20 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	/* Copy the datum */
 	memcpy(valuePtr, DatumGetPointer(value), valueSize);
 	HnswPtrStore(base, element->value, valuePtr);
+
+	/* Store IndexTuple if present */
+	if (indexTuple)
+	{
+		Size indexTupleSize = IndexTupleSize(indexTuple);
+		memcpy(copyIndexTuple, indexTuple, indexTupleSize);
+		element->indexTuple = copyIndexTuple;
+		element->index_tuple_size = indexTupleSize;
+	}
+	else
+	{
+		element->indexTuple = NULL;
+		element->index_tuple_size = 0;
+	}
 
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
@@ -573,22 +603,43 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	HnswBuildState *buildstate = (HnswBuildState *) state;
 	HnswGraph  *graph = buildstate->graph;
 	MemoryContext oldCtx;
+	IndexTuple	indexTuple = NULL;
+	bool		hasIncludeColumns;
 
-	/* Skip nulls */
+	/* Skip nulls in vector column */
 	if (isnull[0])
 		return;
 
 	/* Use memory context */
 	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
 
-	/* Insert tuple */
-	if (InsertTuple(index, values, isnull, tid, buildstate))
+	/* Check if we have INCLUDE columns beyond the vector column */
+	hasIncludeColumns = (index->rd_att->natts > 1);
+	
+	/* Form IndexTuple if we have INCLUDE columns */
+	if (hasIncludeColumns)
+	{
+		indexTuple = index_form_tuple(index->rd_att, values, isnull);
+		if (!indexTuple)
+		{
+			/* Log warning but continue - INCLUDE data is optional for functionality */
+			elog(WARNING, "Failed to form index tuple for INCLUDE columns");
+			/* Continue with NULL indexTuple */
+		}
+	}
+
+	/* Insert tuple with IndexTuple */
+	if (InsertTuple(index, values, isnull, tid, buildstate, indexTuple))
 	{
 		/* Update progress */
 		SpinLockAcquire(&graph->lock);
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
 		SpinLockRelease(&graph->lock);
 	}
+
+	/* Clean up IndexTuple if allocated */
+	if (indexTuple)
+		pfree(indexTuple);
 
 	/* Reset memory context */
 	MemoryContextSwitchTo(oldCtx);
